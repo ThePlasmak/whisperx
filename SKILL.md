@@ -241,13 +241,46 @@ yt-dlp -x --audio-format mp3 <URL> -o audio.mp3
   - `large-v3` + diarization: ~4-5GB
   - Reduce `--batch-size` if OOM
 
+## PyTorch 2.6+ Compatibility (CRITICAL)
+
+**⚠️ PyTorch 2.6 changed `torch.load()` to default to `weights_only=True`.** This breaks pyannote.audio's model loading (used by both VAD and diarization), because the model checkpoints contain globals like `omegaconf.listconfig.ListConfig` and `torch.torch_version.TorchVersion` that aren't allowlisted.
+
+**Symptoms:**
+- `_pickle.UnpicklingError: Weights only load failed` when loading VAD or diarization models
+- `'NoneType' object has no attribute 'to'` (pipeline silently returns None)
+
+**How this skill handles it:**
+
+The `scripts/transcribe.py` uses the **whisperx Python API directly** (not as a subprocess) so it can monkey-patch `torch.load` before any model loading happens:
+
+```python
+import torch
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    kwargs['weights_only'] = False  # Must FORCE, not setdefault — lightning_fabric passes True explicitly
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
+```
+
+**Key details:**
+- The patch **must** use `kwargs['weights_only'] = False` (forced override), NOT `kwargs.setdefault('weights_only', False)` — because `lightning_fabric` explicitly passes `weights_only=True`, which `setdefault` won't override
+- The patch **must** be applied before importing `whisperx`, `pyannote`, or any model loading code
+- This is why the skill uses the Python API instead of shelling out to `whisperx` CLI — a subprocess can't inherit the monkey-patch
+- VAD defaults to **silero** (not pyannote) to avoid a second torch.load issue in the VAD pipeline. Silero loads fine without the patch, but diarization still needs it
+
+**If whisperx CLI is updated to fix this upstream**, the monkey-patch can be removed and the script could switch back to subprocess mode. Track: [whisperX#972](https://github.com/m-bain/whisperX/issues/972)
+
 ## Troubleshooting
+
+**`_pickle.UnpicklingError: Weights only load failed`**: PyTorch 2.6+ compat issue. If running via CLI (`whisperx` command directly), this can't be fixed without patching the installed library. Use this skill's `scripts/transcribe` wrapper instead, which applies the patch automatically. See "PyTorch 2.6+ Compatibility" section above.
 
 **"CUDA not available"**: Install PyTorch with CUDA (`pip install torch --index-url https://download.pytorch.org/whl/cu121`)
 
 **"No module named whisperx"**: Run `./setup.sh` or `pip install whisperx`
 
-**Diarization 403 error**: Accept model agreement at huggingface.co/pyannote/speaker-diarization-community-1
+**Diarization 403 error**: You must accept **both** model agreements — see "Speaker Diarization Setup" above
+
+**`'NoneType' object has no attribute 'to'`**: Either the HF token is invalid, the model agreements haven't been accepted, or the torch.load patch isn't applied. Check all three.
 
 **OOM on GPU**: Lower `--batch-size` to 4 or 2
 
