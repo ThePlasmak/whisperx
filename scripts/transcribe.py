@@ -7,7 +7,7 @@ Uses the whisperx Python API directly (not subprocess) to apply PyTorch 2.6+
 compatibility patches for pyannote model loading.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.0.0"
 
 import sys
 import os

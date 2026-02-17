@@ -1,7 +1,7 @@
 ---
 name: whisperx
 description: Speech-to-text with word-level timestamps, speaker diarization, and forced alignment using WhisperX. Built on faster-whisper with batched inference for 70x realtime speed.
-version: 1.1.0
+version: 1.0.0
 author: Sarah Mak
 tags: ["audio", "transcription", "whisperx", "speech-to-text", "diarization", "alignment", "subtitles", "ml", "cuda", "gpu"]
 homepage: https://github.com/ThePlasmak/whisperx
