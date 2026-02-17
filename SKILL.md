@@ -1,9 +1,8 @@
 ---
 name: whisperx
 description: Speech-to-text with word-level timestamps, speaker diarization, and forced alignment using WhisperX. Built on faster-whisper with batched inference for 70x realtime speed.
-version: 1.0.0
+version: 1.1.0
 author: Sarah Mak
-homepage: https://github.com/ThePlasmak/whisperx
 tags: ["audio", "transcription", "whisperx", "speech-to-text", "diarization", "alignment", "subtitles", "ml", "cuda", "gpu"]
 platforms: ["linux", "macos", "wsl2"]
 metadata: {"openclaw":{"emoji":"🎙️","requires":{"bins":["ffmpeg","python3"]}}}
@@ -26,8 +25,9 @@ Use this skill when you need to:
 - **Generate subtitle files** — SRT, VTT with accurate word timestamps
 - **Translate speech to English** — from any supported language
 - **Batch transcribe** — efficient processing of multiple files
+- **Transcribe a section** — extract just part of a long recording
 
-**Trigger phrases:** "transcribe with speakers", "who said what", "diarize", "make subtitles", "word timestamps", "speaker identification", "meeting transcript"
+**Trigger phrases:** "transcribe with speakers", "who said what", "diarize", "make subtitles", "word timestamps", "speaker identification", "meeting transcript", "karaoke subtitles"
 
 **When NOT to use:**
 - Simple transcription without speaker/timing needs → use **faster-whisper** (lighter, faster)
@@ -42,7 +42,10 @@ Use this skill when you need to:
 | Speaker diarization | ❌ | ✅ |
 | Forced alignment | ❌ | ✅ |
 | Batched inference | ❌ | ✅ |
-| Subtitle generation | Manual | Built-in (SRT/VTT) |
+| Word-level subtitles | ❌ | ✅ (karaoke-style) |
+| Subtitle generation | Manual | Built-in (SRT/VTT/TSV) |
+| Time range trimming | ❌ | ✅ (--start/--end) |
+| Initial prompt | ❌ | ✅ (domain terms) |
 | Setup complexity | Simple | Requires HF token for diarization |
 
 ## Quick Reference
@@ -54,11 +57,16 @@ All commands use `./scripts/transcribe` (the skill wrapper), **not** the `whispe
 | **Basic transcription** | `./scripts/transcribe audio.mp3` | Word-aligned by default |
 | **With speakers** | `./scripts/transcribe audio.mp3 --diarize` | Auto-reads `~/.cache/huggingface/token` |
 | **SRT subtitles** | `./scripts/transcribe audio.mp3 --srt -o subs.srt` | Ready for video players |
+| **Word-level SRT** | `./scripts/transcribe audio.mp3 --srt --word-level` | Karaoke-style, one word per cue |
 | **VTT subtitles** | `./scripts/transcribe audio.mp3 --vtt -o subs.vtt` | Web-compatible format |
 | **JSON output** | `./scripts/transcribe audio.mp3 --json` | Full data with word timestamps |
+| **TSV output** | `./scripts/transcribe audio.mp3 --tsv` | Spreadsheet-friendly |
 | **Translate to English** | `./scripts/transcribe audio.mp3 --translate` | Any language → English |
 | **Fast, no alignment** | `./scripts/transcribe audio.mp3 --no-align` | Skip forced alignment |
 | **Specific language** | `./scripts/transcribe audio.mp3 -l en` | Faster than auto-detect |
+| **Partial transcription** | `./scripts/transcribe audio.mp3 --start 1:30 --end 5:00` | Only a section |
+| **Domain accuracy** | `./scripts/transcribe audio.mp3 --initial-prompt "OpenAI, GPT-4"` | Guide the model |
+| **Auto-detect format** | `./scripts/transcribe audio.mp3 -o out.srt` | Format from extension |
 
 **⚠️ Do NOT run `whisperx` CLI directly** — it will crash on PyTorch 2.6+ with pyannote models. Always use this skill's `./scripts/transcribe` wrapper.
 
@@ -126,6 +134,9 @@ No setup needed — just run `./scripts/transcribe`. The wrapper script:
 # Test diarization — should show [SPEAKER_00], [SPEAKER_01], etc.
 ./scripts/transcribe some_audio.mp3 --diarize
 
+# Check version
+./scripts/transcribe --version
+
 # If diarization fails with 403: model agreements not accepted (see step 3 above)
 # If it crashes with pickle/weights_only error: you're running `whisperx` CLI directly instead of the wrapper
 ```
@@ -151,11 +162,24 @@ All commands use `./scripts/transcribe` — resolve the path relative to this sk
 # With speaker diarization (auto-reads ~/.cache/huggingface/token)
 ./scripts/transcribe audio.mp3 --diarize
 
-# With explicit HF token
-./scripts/transcribe audio.mp3 --diarize --hf-token hf_YOUR_TOKEN
-
 # Generate SRT subtitles
 ./scripts/transcribe audio.mp3 --srt -o subtitles.srt
+
+# Word-level karaoke subtitles (one word per cue with precise timing)
+./scripts/transcribe audio.mp3 --srt --word-level -o karaoke.srt
+
+# Auto-detect format from output filename
+./scripts/transcribe audio.mp3 -o transcript.json
+./scripts/transcribe audio.mp3 -o subtitles.vtt
+
+# TSV for spreadsheets/data analysis
+./scripts/transcribe audio.mp3 --tsv -o transcript.tsv
+
+# Transcribe only a section (useful for long recordings)
+./scripts/transcribe podcast.mp3 --start 10:30 --end 15:00
+
+# Improve accuracy for specific terms, names, or acronyms
+./scripts/transcribe meeting.mp3 --initial-prompt "Attendees: Alice, Bob. Topics: Kubernetes, gRPC, OAuth2"
 
 # Maximum accuracy
 ./scripts/transcribe audio.mp3 --model large-v3
@@ -182,6 +206,7 @@ Model options:
   -m, --model NAME       Whisper model (default: large-v3-turbo)
   --batch-size N         Batch size for inference (default: 8, lower if OOM)
   --beam-size N          Beam search size (higher = slower but more accurate)
+  --initial-prompt TEXT   Condition the model with domain terms, names, acronyms
 
 Device options:
   --device               cpu, cuda, or auto (default: auto)
@@ -190,6 +215,10 @@ Device options:
 Language options:
   -l, --language CODE    Language code (auto-detects if omitted)
   --translate            Translate to English
+
+Time range:
+  --start TIME           Start time — seconds (90), MM:SS (1:30), HH:MM:SS
+  --end TIME             End time — same formats as --start
 
 Alignment options:
   --no-align             Skip forced alignment (no word timestamps)
@@ -205,11 +234,87 @@ Output options:
   -j, --json             JSON output with segments and word timestamps
   --srt                  SRT subtitle format
   --vtt                  WebVTT subtitle format
-  -o, --output FILE      Save to file instead of stdout
+  --tsv                  TSV (tab-separated values) for data analysis
+  --word-level           Word-level subtitles (SRT/VTT only) — karaoke-style
+  --output-format FMT    Explicit format (srt, vtt, txt, json, tsv)
+  -o, --output FILE      Save to file (format auto-detected from extension)
 
 Miscellaneous:
+  -V, --version          Show version
   -q, --quiet            Suppress progress messages
 ```
+
+## Output Formats
+
+### Plain Text (default)
+```
+Hello and welcome to the show.
+Today we're talking about AI transcription.
+```
+
+### Plain Text with Diarization (`--diarize`)
+```
+[SPEAKER_00] Hello and welcome to the show.
+[SPEAKER_01] Thanks for having me.
+```
+
+### SRT (`--srt`)
+Standard subtitle format, compatible with VLC, YouTube, etc.
+```
+1
+00:00:00,000 --> 00:00:03,500
+Hello and welcome to the show.
+
+2
+00:00:03,500 --> 00:00:06,200
+Today we're talking about AI transcription.
+```
+
+### Word-Level SRT (`--srt --word-level`)
+One word per cue — for karaoke-style highlighting or precise editing.
+```
+1
+00:00:00,000 --> 00:00:00,320
+Hello
+
+2
+00:00:00,320 --> 00:00:00,560
+and
+
+3
+00:00:00,560 --> 00:00:01,100
+welcome
+```
+
+### JSON (`--json`)
+Structured output with word-level timestamps and confidence scores.
+```json
+{
+  "segments": [
+    {
+      "start": 0.0,
+      "end": 3.5,
+      "text": "Hello and welcome to the show.",
+      "speaker": "SPEAKER_00",
+      "words": [
+        {"word": "Hello", "start": 0.0, "end": 0.32, "confidence": 0.98},
+        {"word": "and", "start": 0.32, "end": 0.56, "confidence": 0.95}
+      ]
+    }
+  ]
+}
+```
+
+### TSV (`--tsv`)
+Tab-separated values for spreadsheets and data pipelines.
+```
+start	end	text
+0.000	3.500	Hello and welcome to the show.
+3.500	6.200	Today we're talking about AI transcription.
+```
+
+### WebVTT (`--vtt`)
+Web-native subtitle format for HTML5 `<video>` and `<track>`.
 
 ## Examples
 
@@ -218,8 +323,17 @@ Miscellaneous:
 ./scripts/transcribe meeting.mp3 --diarize \
   --min-speakers 3 --max-speakers 5 --json -o meeting.json
 
-# Generate subtitles
+# Generate subtitles for a video
 ./scripts/transcribe video.mp4 --srt -o video.srt
+
+# Karaoke-style word-level subtitles
+./scripts/transcribe song.mp3 --vtt --word-level -o karaoke.vtt
+
+# Transcribe just the interesting part of a podcast
+./scripts/transcribe podcast.mp3 --start 45:00 --end 1:02:30 --diarize
+
+# Improve accuracy for technical content
+./scripts/transcribe lecture.mp3 --initial-prompt "Topics: PyTorch, CUDA, CTranslate2, whisperx"
 
 # Batch transcribe a folder
 for file in recordings/*.mp3; do
@@ -233,8 +347,13 @@ yt-dlp -x --audio-format mp3 <URL> -o audio.mp3
 # Quick draft (fast, no alignment)
 ./scripts/transcribe audio.mp3 --model base --no-align
 
-# German audio
-./scripts/transcribe audio.mp3 -l de --model large-v3-turbo
+# German audio with TSV output for analysis
+./scripts/transcribe audio.mp3 -l de --tsv -o transcript.tsv
+
+# Auto-detect format from filename
+./scripts/transcribe audio.mp3 -o transcript.srt   # → SRT
+./scripts/transcribe audio.mp3 -o data.json         # → JSON
+./scripts/transcribe audio.mp3 -o export.tsv        # → TSV
 ```
 
 ## Common Mistakes
@@ -249,6 +368,7 @@ yt-dlp -x --audio-format mp3 <URL> -o audio.mp3
 | **Using large-v3 when turbo works** | Unnecessary slowdown | `large-v3-turbo` is faster with near-identical accuracy |
 | **Forgetting --language** | Wastes time auto-detecting | Specify `-l en` when you know the language |
 | **Using WhisperX for simple transcription** | Heavier setup for no benefit | Use faster-whisper for basic transcription |
+| **--word-level without --srt/--vtt** | Flag is ignored | Word-level only applies to subtitle formats |
 
 ## Performance Notes
 
@@ -259,6 +379,16 @@ yt-dlp -x --audio-format mp3 <URL> -o audio.mp3
   - `large-v3-turbo`: ~2-3GB
   - `large-v3` + diarization: ~4-5GB
   - Reduce `--batch-size` if OOM
+- **Completion stats**: The tool prints segment/word counts and speed ratio at the end
+
+## Supported Languages
+
+WhisperX supports all languages that Whisper supports (99 languages). **Forced alignment** (word timestamps) is available for a subset — if alignment fails for a language, the tool falls back gracefully to segment-level timestamps.
+
+**Languages with alignment support** (common subset):
+`en` English, `zh` Chinese, `de` German, `es` Spanish, `fr` French, `it` Italian, `ja` Japanese, `ko` Korean, `pt` Portuguese, `ru` Russian, `nl` Dutch, `pl` Polish, `tr` Turkish, `ar` Arabic, `sv` Swedish, `da` Danish, `fi` Finnish, `hu` Hungarian, `uk` Ukrainian, `el` Greek, `cs` Czech, `ro` Romanian, `vi` Vietnamese, `th` Thai, `hi` Hindi, `he` Hebrew, `id` Indonesian, `ms` Malay, `no` Norwegian, `fa` Persian, `bg` Bulgarian, `ca` Catalan, `hr` Croatian, `sk` Slovak, `sl` Slovenian, `ta` Tamil, `te` Telugu, `ur` Urdu
+
+For the full list, see [whisperx/alignment.py](https://github.com/m-bain/whisperX/blob/main/whisperx/alignment.py).
 
 ## PyTorch 2.6+ Compatibility (CRITICAL)
 
@@ -303,9 +433,13 @@ torch.load = _patched_torch_load
 
 **OOM on GPU**: Lower `--batch-size` to 4 or 2
 
-**Alignment fails for language X**: Check supported languages in [whisperx alignment.py](https://github.com/m-bain/whisperX/blob/main/whisperx/alignment.py)
+**Alignment fails for language X**: The language may not have a wav2vec2 alignment model. The tool will fall back to segment-level timestamps and print a warning. Check supported languages in [whisperx alignment.py](https://github.com/m-bain/whisperX/blob/main/whisperx/alignment.py).
 
-**Slow on CPU**: Expected — use GPU for practical transcription
+**Slow on CPU**: Expected — use GPU for practical transcription. Even `tiny` model on CPU is ~5-10x slower than `large-v3-turbo` on a mid-range GPU.
+
+**Empty output / no segments**: Audio may be silence or too short. Check with `ffprobe audio.mp3` to verify the file has actual audio content.
+
+**Timestamps wrong after trimming**: If using `--start`, timestamps in the output reflect the original file's timeline (not relative to the trim point). This is by design — subtitle timecodes stay correct for the source video.
 
 ## References
 
