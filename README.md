@@ -44,7 +44,7 @@ Requires a free [Hugging Face token](https://huggingface.co/settings/tokens) and
 
 | Need | Use |
 |------|-----|
-| Simple transcription | faster-whisper |
+| Simple transcription | faster-whisper (faster than whisper-x as fewer features need to be loaded) |
 | Word-level timestamps | **whisperx** |
 | Speaker identification | **whisperx** |
 | Subtitle generation | **whisperx** |
