@@ -1,0 +1,29 @@
+{
+  "name": "whisperx",
+  "version": "1.0.0",
+  "description": "Speech-to-text with word-level timestamps, speaker diarization, and forced alignment using WhisperX. Built on faster-whisper with batched inference for 70x realtime speed.",
+  "author": "Sarah Mak",
+  "tags": [
+    "whisperx",
+    "transcription",
+    "speech-to-text",
+    "diarization",
+    "alignment",
+    "gpu",
+    "cuda",
+    "audio",
+    "ml",
+    "subtitles"
+  ],
+  "requires": {
+    "bins": [
+      "python3",
+      "ffmpeg"
+    ]
+  },
+  "platforms": [
+    "linux",
+    "macos",
+    "wsl2"
+  ]
+}
