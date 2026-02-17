@@ -181,6 +181,7 @@ AUDIO_FILE               Path to audio/video file
 Model options:
   -m, --model NAME       Whisper model (default: large-v3-turbo)
   --batch-size N         Batch size for inference (default: 8, lower if OOM)
+  --beam-size N          Beam search size (higher = slower but more accurate)
 
 Device options:
   --device               cpu, cuda, or auto (default: auto)
@@ -242,7 +243,8 @@ yt-dlp -x --audio-format mp3 <URL> -o audio.mp3
 |---------|---------|----------|
 | **Using CPU when GPU available** | 10-70x slower | Check `nvidia-smi`; verify CUDA |
 | **Missing HF token for diarize** | Diarization fails | Get token from huggingface.co/settings/tokens |
-| **Not accepting model agreement** | 403 error on diarization model | Accept at huggingface.co/pyannote/speaker-diarization-community-1 |
+| **Not accepting model agreements** | 403 error on diarization model | Accept **both** pyannote/speaker-diarization-3.1 AND pyannote/segmentation-3.0 (see Setup) |
+| **Running `whisperx` CLI directly** | Crashes on PyTorch 2.6+ | Always use `./scripts/transcribe` wrapper (applies torch.load patch) |
 | **batch_size too high** | CUDA OOM | Lower `--batch-size` (try 4 or 2) |
 | **Using large-v3 when turbo works** | Unnecessary slowdown | `large-v3-turbo` is faster with near-identical accuracy |
 | **Forgetting --language** | Wastes time auto-detecting | Specify `-l en` when you know the language |

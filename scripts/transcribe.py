@@ -11,7 +11,7 @@ import sys
 import os
 import json
 import argparse
-import tempfile
+import time
 from pathlib import Path
 
 # --- PyTorch 2.6+ compatibility patch ---
@@ -92,24 +92,31 @@ def run_whisperx(args):
         print(f"   Transcribing: {audio_path.name}", file=sys.stderr)
         print("", file=sys.stderr)
 
+    start_time = time.time()
+
     # 1. Load audio
     audio = whisperx.load_audio(str(audio_path))
 
     # 2. Transcribe with batched inference
+    task = "translate" if args.translate else "transcribe"
     model = whisperx.load_model(
         args.model,
         device,
         compute_type=compute_type,
         language=args.language,
+        task=task,
         vad_method="silero",  # silero avoids pyannote VAD torch.load issue
     )
 
-    result = model.transcribe(
-        audio,
-        batch_size=args.batch_size,
-        language=args.language,
-        print_progress=not args.quiet,
-    )
+    transcribe_kwargs = {
+        "batch_size": args.batch_size,
+        "language": args.language,
+        "print_progress": not args.quiet,
+    }
+    if args.beam_size:
+        transcribe_kwargs["beam_size"] = args.beam_size
+
+    result = model.transcribe(audio, **transcribe_kwargs)
 
     detected_language = result.get("language", args.language or "en")
     if not args.quiet and not args.language:
@@ -126,24 +133,29 @@ def run_whisperx(args):
         if not args.quiet:
             print("   Aligning...", file=sys.stderr)
 
-        align_model, metadata = whisperx.load_align_model(
-            language_code=detected_language,
-            device=device,
-            model_name=args.align_model,
-        )
-        result = whisperx.align(
-            result["segments"],
-            align_model,
-            metadata,
-            audio,
-            device,
-            return_char_alignments=False,
-        )
+        try:
+            align_model, metadata = whisperx.load_align_model(
+                language_code=detected_language,
+                device=device,
+                model_name=args.align_model,
+            )
+            result = whisperx.align(
+                result["segments"],
+                align_model,
+                metadata,
+                audio,
+                device,
+                return_char_alignments=False,
+            )
 
-        del align_model
-        gc.collect()
-        if device == "cuda":
-            torch.cuda.empty_cache()
+            del align_model
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        except Exception as e:
+            if not args.quiet:
+                print(f"   ⚠️  Alignment failed for language '{detected_language}': {e}", file=sys.stderr)
+                print("   Continuing without word-level timestamps. Use --no-align to suppress this.", file=sys.stderr)
 
     # 4. Speaker diarization (if requested)
     if args.diarize:
@@ -205,7 +217,10 @@ def run_whisperx(args):
         print(output)
 
     if not args.quiet:
-        print("", file=sys.stderr)
+        elapsed = time.time() - start_time
+        audio_duration = len(audio) / 16000  # whisperx loads at 16kHz
+        speed = audio_duration / elapsed if elapsed > 0 else 0
+        print(f"\n   Done in {elapsed:.1f}s ({speed:.1f}x realtime)", file=sys.stderr)
 
 
 def _format_timestamp_srt(seconds):
