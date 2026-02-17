@@ -2,15 +2,32 @@
 """
 WhisperX transcription CLI wrapper
 Speech-to-text with word-level alignment, speaker diarization, and batched inference.
+
+Uses the whisperx Python API directly (not subprocess) to apply PyTorch 2.6+
+compatibility patches for pyannote model loading.
 """
 
 import sys
 import os
 import json
 import argparse
-import subprocess
 import tempfile
 from pathlib import Path
+
+# --- PyTorch 2.6+ compatibility patch ---
+# pyannote.audio and lightning_fabric use torch.load with weights_only=True (new default),
+# but the model checkpoints contain globals that aren't allowlisted.
+# Force weights_only=False for these trusted HuggingFace models.
+try:
+    import torch
+    _original_torch_load = torch.load
+    def _patched_torch_load(*args, **kwargs):
+        kwargs['weights_only'] = False
+        return _original_torch_load(*args, **kwargs)
+    torch.load = _patched_torch_load
+except ImportError:
+    pass
+# --- End patch ---
 
 
 def check_cuda_available():
@@ -24,106 +41,40 @@ def check_cuda_available():
         return False, None
 
 
-def check_whisperx():
-    """Check if whisperx is installed."""
-    try:
-        import whisperx
-        return True
-    except ImportError:
-        return False
+def get_hf_token(args_token):
+    """Resolve HF token from args, env, or cache."""
+    if args_token:
+        return args_token
+    if os.environ.get("HF_TOKEN"):
+        return os.environ["HF_TOKEN"]
+    token_path = Path.home() / ".cache" / "huggingface" / "token"
+    if token_path.exists():
+        return token_path.read_text().strip()
+    return None
 
 
-def run_whisperx_cli(args):
-    """Run whisperx as a subprocess using the CLI."""
-    cmd = ["whisperx", str(args.audio)]
+def run_whisperx(args):
+    """Run whisperx using the Python API."""
+    import whisperx
+    import gc
 
-    # Model
-    cmd.extend(["--model", args.model])
+    audio_path = Path(args.audio)
 
-    # Device
+    # Resolve device
     cuda_available, gpu_name = check_cuda_available()
     if args.device == "auto":
         device = "cuda" if cuda_available else "cpu"
     else:
         device = args.device
-    cmd.extend(["--device", device])
 
-    # Compute type
+    if device == "cpu" and not args.quiet:
+        print("⚠️  CUDA not available — using CPU (this will be slow!)", file=sys.stderr)
+
+    # Resolve compute type
     if args.compute_type == "auto":
         compute_type = "float16" if device == "cuda" else "int8"
     else:
         compute_type = args.compute_type
-    cmd.extend(["--compute_type", compute_type])
-
-    # Batch size
-    cmd.extend(["--batch_size", str(args.batch_size)])
-
-    # Language
-    if args.language:
-        cmd.extend(["--language", args.language])
-
-    # Output
-    output_dir = tempfile.mkdtemp(prefix="whisperx_") if not args.output_dir else args.output_dir
-    cmd.extend(["--output_dir", output_dir])
-    cmd.extend(["--output_format", args.output_format])
-
-    # Task (transcribe or translate)
-    if args.translate:
-        cmd.extend(["--task", "translate"])
-
-    # Alignment
-    if args.no_align:
-        cmd.append("--no_align")
-    if args.align_model:
-        cmd.extend(["--align_model", args.align_model])
-
-    # Diarization
-    if args.diarize:
-        cmd.append("--diarize")
-        if args.hf_token:
-            cmd.extend(["--hf_token", args.hf_token])
-        elif os.environ.get("HF_TOKEN"):
-            cmd.extend(["--hf_token", os.environ["HF_TOKEN"]])
-        else:
-            # Check cached token
-            token_path = Path.home() / ".cache" / "huggingface" / "token"
-            if token_path.exists():
-                cmd.extend(["--hf_token", token_path.read_text().strip()])
-            else:
-                print("⚠️  Diarization requires a Hugging Face token.", file=sys.stderr)
-                print("   Get one at: https://huggingface.co/settings/tokens", file=sys.stderr)
-                print("   Then pass --hf-token YOUR_TOKEN or set HF_TOKEN env var", file=sys.stderr)
-                print("   You must also accept the model agreement at:", file=sys.stderr)
-                print("   https://huggingface.co/pyannote/speaker-diarization-community-1", file=sys.stderr)
-                sys.exit(1)
-
-        if args.min_speakers:
-            cmd.extend(["--min_speakers", str(args.min_speakers)])
-        if args.max_speakers:
-            cmd.extend(["--max_speakers", str(args.max_speakers)])
-
-    # VAD — default to silero to avoid pyannote torch.load weights_only issue (PyTorch 2.6+)
-    vad_method = args.vad_method or "silero"
-    cmd.extend(["--vad_method", vad_method])
-
-    # Beam size
-    if args.beam_size:
-        cmd.extend(["--beam_size", str(args.beam_size)])
-
-    # Highlight words in SRT/VTT
-    if args.highlight_words:
-        cmd.extend(["--highlight_words", "True"])
-
-    # Segment resolution
-    if args.segment_resolution:
-        cmd.extend(["--segment_resolution", args.segment_resolution])
-
-    # Suppress numerals
-    if args.suppress_numerals:
-        cmd.append("--suppress_numerals")
-
-    # Print progress
-    cmd.extend(["--print_progress", "True"])
 
     if not args.quiet:
         if device == "cuda" and gpu_name:
@@ -138,104 +89,167 @@ def run_whisperx_cli(args):
             features.append("alignment")
         if features:
             print(f"   Features: {', '.join(features)}", file=sys.stderr)
-
-        print(f"   Transcribing: {Path(args.audio).name}", file=sys.stderr)
+        print(f"   Transcribing: {audio_path.name}", file=sys.stderr)
         print("", file=sys.stderr)
 
-    # Run whisperx
-    result = subprocess.run(cmd, capture_output=not args.verbose, text=True)
+    # 1. Load audio
+    audio = whisperx.load_audio(str(audio_path))
 
-    if result.returncode != 0:
-        if not args.verbose and result.stderr:
-            print(result.stderr, file=sys.stderr)
-        print(f"❌ WhisperX exited with code {result.returncode}", file=sys.stderr)
-        sys.exit(result.returncode)
+    # 2. Transcribe with batched inference
+    model = whisperx.load_model(
+        args.model,
+        device,
+        compute_type=compute_type,
+        language=args.language,
+        vad_method="silero",  # silero avoids pyannote VAD torch.load issue
+    )
 
-    # Read and output results
-    audio_stem = Path(args.audio).stem
+    result = model.transcribe(
+        audio,
+        batch_size=args.batch_size,
+        language=args.language,
+        print_progress=not args.quiet,
+    )
+
+    detected_language = result.get("language", args.language or "en")
+    if not args.quiet and not args.language:
+        print(f"   Detected language: {detected_language}", file=sys.stderr)
+
+    # Free model memory
+    del model
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    # 3. Forced alignment (unless --no-align)
+    if not args.no_align:
+        if not args.quiet:
+            print("   Aligning...", file=sys.stderr)
+
+        align_model, metadata = whisperx.load_align_model(
+            language_code=detected_language,
+            device=device,
+            model_name=args.align_model,
+        )
+        result = whisperx.align(
+            result["segments"],
+            align_model,
+            metadata,
+            audio,
+            device,
+            return_char_alignments=False,
+        )
+
+        del align_model
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    # 4. Speaker diarization (if requested)
+    if args.diarize:
+        hf_token = get_hf_token(args.hf_token)
+        if not hf_token:
+            print("⚠️  Diarization requires a Hugging Face token.", file=sys.stderr)
+            print("   Get one at: https://huggingface.co/settings/tokens", file=sys.stderr)
+            print("   Then pass --hf-token TOKEN or set HF_TOKEN env var", file=sys.stderr)
+            sys.exit(1)
+
+        if not args.quiet:
+            print("   Diarizing speakers...", file=sys.stderr)
+
+        from whisperx.diarize import DiarizationPipeline
+        diarize_model = DiarizationPipeline(
+            use_auth_token=hf_token,
+            device=device,
+        )
+
+        diarize_kwargs = {}
+        if args.min_speakers:
+            diarize_kwargs["min_speakers"] = args.min_speakers
+        if args.max_speakers:
+            diarize_kwargs["max_speakers"] = args.max_speakers
+
+        diarize_segments = diarize_model(audio, **diarize_kwargs)
+        result = whisperx.assign_word_speakers(diarize_segments, result)
+
+        del diarize_model
+        gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+    # 5. Output results
+    segments = result.get("segments", [])
 
     if args.json or args.output_format == "json":
-        # Return JSON output
-        json_file = Path(output_dir) / f"{audio_stem}.json"
-        if json_file.exists():
-            content = json_file.read_text(encoding="utf-8")
-            if args.output:
-                Path(args.output).write_text(content, encoding="utf-8")
-                if not args.quiet:
-                    print(f"✅ Saved JSON to: {args.output}", file=sys.stderr)
-            else:
-                print(content)
-        else:
-            print(f"⚠️  JSON output not found at {json_file}", file=sys.stderr)
-
+        output = json.dumps(result, indent=2, ensure_ascii=False)
     elif args.srt or args.output_format == "srt":
-        srt_file = Path(output_dir) / f"{audio_stem}.srt"
-        if srt_file.exists():
-            content = srt_file.read_text(encoding="utf-8")
-            if args.output:
-                Path(args.output).write_text(content, encoding="utf-8")
-                if not args.quiet:
-                    print(f"✅ Saved SRT to: {args.output}", file=sys.stderr)
-            else:
-                print(content)
-        else:
-            print(f"⚠️  SRT output not found at {srt_file}", file=sys.stderr)
-
+        output = _segments_to_srt(segments, args.diarize)
     elif args.vtt or args.output_format == "vtt":
-        vtt_file = Path(output_dir) / f"{audio_stem}.vtt"
-        if vtt_file.exists():
-            content = vtt_file.read_text(encoding="utf-8")
-            if args.output:
-                Path(args.output).write_text(content, encoding="utf-8")
-                if not args.quiet:
-                    print(f"✅ Saved VTT to: {args.output}", file=sys.stderr)
-            else:
-                print(content)
-        else:
-            print(f"⚠️  VTT output not found at {vtt_file}", file=sys.stderr)
-
+        output = _segments_to_vtt(segments, args.diarize)
     else:
-        # Default: txt output (plain transcript)
-        txt_file = Path(output_dir) / f"{audio_stem}.txt"
-        if txt_file.exists():
-            content = txt_file.read_text(encoding="utf-8")
-            if args.output:
-                Path(args.output).write_text(content, encoding="utf-8")
-                if not args.quiet:
-                    print(f"✅ Saved transcript to: {args.output}", file=sys.stderr)
+        # Plain text
+        lines = []
+        for seg in segments:
+            text = seg.get("text", "").strip()
+            if args.diarize and "speaker" in seg:
+                lines.append(f"[{seg['speaker']}] {text}")
             else:
-                print(content)
-        else:
-            # Try JSON fallback
-            json_file = Path(output_dir) / f"{audio_stem}.json"
-            if json_file.exists():
-                data = json.loads(json_file.read_text(encoding="utf-8"))
-                segments = data.get("segments", [])
-                text = " ".join(s.get("text", "").strip() for s in segments)
-                print(text)
-            else:
-                print(f"⚠️  No output found in {output_dir}", file=sys.stderr)
+                lines.append(text)
+        output = "\n".join(lines)
 
-    # List all generated files
-    if not args.quiet and args.output_format == "all":
-        generated = list(Path(output_dir).glob(f"{audio_stem}.*"))
-        if generated:
-            print("", file=sys.stderr)
-            print("📁 Generated files:", file=sys.stderr)
-            for f in sorted(generated):
-                size = f.stat().st_size
-                if size > 1024:
-                    print(f"   {f.name} ({size / 1024:.1f} KB)", file=sys.stderr)
-                else:
-                    print(f"   {f.name} ({size} B)", file=sys.stderr)
-
-    # Clean up temp dir if we created one and user didn't ask for all formats
-    if not args.output_dir and args.output_format != "all":
-        import shutil
-        shutil.rmtree(output_dir, ignore_errors=True)
-    elif not args.output_dir:
+    if args.output:
+        Path(args.output).write_text(output, encoding="utf-8")
         if not args.quiet:
-            print(f"   Location: {output_dir}", file=sys.stderr)
+            print(f"\n✅ Saved to: {args.output}", file=sys.stderr)
+    else:
+        print(output)
+
+    if not args.quiet:
+        print("", file=sys.stderr)
+
+
+def _format_timestamp_srt(seconds):
+    """Format seconds as SRT timestamp: HH:MM:SS,mmm"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+def _format_timestamp_vtt(seconds):
+    """Format seconds as VTT timestamp: HH:MM:SS.mmm"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+def _segments_to_srt(segments, include_speaker=False):
+    """Convert segments to SRT subtitle format."""
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        start = _format_timestamp_srt(seg.get("start", 0))
+        end = _format_timestamp_srt(seg.get("end", 0))
+        text = seg.get("text", "").strip()
+        if include_speaker and "speaker" in seg:
+            text = f"[{seg['speaker']}] {text}"
+        lines.append(f"{i}\n{start} --> {end}\n{text}\n")
+    return "\n".join(lines)
+
+
+def _segments_to_vtt(segments, include_speaker=False):
+    """Convert segments to WebVTT subtitle format."""
+    lines = ["WEBVTT\n"]
+    for seg in segments:
+        start = _format_timestamp_vtt(seg.get("start", 0))
+        end = _format_timestamp_vtt(seg.get("end", 0))
+        text = seg.get("text", "").strip()
+        if include_speaker and "speaker" in seg:
+            text = f"[{seg['speaker']}] {text}"
+        lines.append(f"{start} --> {end}\n{text}\n")
+    return "\n".join(lines)
 
 
 def main():
@@ -245,11 +259,11 @@ def main():
         epilog="""
 Examples:
   %(prog)s audio.mp3                          # Basic transcription
-  %(prog)s audio.mp3 --diarize --hf-token X   # With speaker labels
+  %(prog)s audio.mp3 --diarize                # With speaker labels (needs HF token)
   %(prog)s audio.mp3 --model large-v3-turbo   # Maximum accuracy
   %(prog)s audio.mp3 --srt -o subtitles.srt   # Generate subtitles
-  %(prog)s audio.mp3 --json                    # JSON with word timestamps
-  %(prog)s audio.mp3 --translate               # Translate to English
+  %(prog)s audio.mp3 --json                   # JSON with word timestamps
+  %(prog)s audio.mp3 --translate              # Translate to English
 """
     )
 
@@ -353,15 +367,6 @@ Examples:
         help="Maximum number of speakers (helps diarization accuracy)"
     )
 
-    # VAD options
-    vad_group = parser.add_argument_group("Voice Activity Detection")
-    vad_group.add_argument(
-        "--vad-method",
-        default=None,
-        choices=["pyannote", "silero"],
-        help="VAD method (default: pyannote)"
-    )
-
     # Output options
     output_group = parser.add_argument_group("Output options")
     output_group.add_argument(
@@ -382,43 +387,17 @@ Examples:
     output_group.add_argument(
         "--output-format",
         default="txt",
-        choices=["all", "srt", "vtt", "txt", "tsv", "json", "aud"],
-        help="Output format (default: txt). Use 'all' to generate all formats"
+        choices=["srt", "vtt", "txt", "json"],
+        help="Output format (default: txt)"
     )
     output_group.add_argument(
         "-o", "--output",
         metavar="FILE",
         help="Save output to FILE instead of stdout"
     )
-    output_group.add_argument(
-        "--output-dir",
-        metavar="DIR",
-        help="Directory for output files (for 'all' format)"
-    )
-    output_group.add_argument(
-        "--highlight-words",
-        action="store_true",
-        help="Underline each word as spoken in SRT/VTT"
-    )
-    output_group.add_argument(
-        "--segment-resolution",
-        default=None,
-        choices=["sentence", "chunk"],
-        help="Segment resolution (default: sentence)"
-    )
 
     # Misc options
     misc_group = parser.add_argument_group("Miscellaneous")
-    misc_group.add_argument(
-        "--suppress-numerals",
-        action="store_true",
-        help="Suppress numeric output (spell out numbers)"
-    )
-    misc_group.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Show full whisperx output"
-    )
     misc_group.add_argument(
         "-q", "--quiet",
         action="store_true",
@@ -441,14 +420,16 @@ Examples:
     elif args.vtt:
         args.output_format = "vtt"
 
-    # Check whisperx is available
-    if not check_whisperx():
+    # Check whisperx
+    try:
+        import whisperx
+    except ImportError:
         print("❌ whisperx not installed", file=sys.stderr)
         print("   Install: pip install whisperx", file=sys.stderr)
         print("   Or run: ./setup.sh", file=sys.stderr)
         sys.exit(1)
 
-    run_whisperx_cli(args)
+    run_whisperx(args)
 
 
 if __name__ == "__main__":
