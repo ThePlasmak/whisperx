@@ -102,9 +102,9 @@ def run_whisperx_cli(args):
         if args.max_speakers:
             cmd.extend(["--max_speakers", str(args.max_speakers)])
 
-    # VAD
-    if args.vad_method:
-        cmd.extend(["--vad_method", args.vad_method])
+    # VAD — default to silero to avoid pyannote torch.load weights_only issue (PyTorch 2.6+)
+    vad_method = args.vad_method or "silero"
+    cmd.extend(["--vad_method", vad_method])
 
     # Beam size
     if args.beam_size:
