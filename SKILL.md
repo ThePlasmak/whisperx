@@ -47,17 +47,20 @@ Use this skill when you need to:
 
 ## Quick Reference
 
+All commands use `./scripts/transcribe` (the skill wrapper), **not** the `whisperx` CLI directly. The wrapper applies a required PyTorch compatibility patch — see "PyTorch 2.6+ Compatibility" below.
+
 | Task | Command | Notes |
 |------|---------|-------|
 | **Basic transcription** | `./scripts/transcribe audio.mp3` | Word-aligned by default |
-| **With speakers** | `./scripts/transcribe audio.mp3 --diarize --hf-token TOKEN` | Labels each segment |
+| **With speakers** | `./scripts/transcribe audio.mp3 --diarize` | Auto-reads `~/.cache/huggingface/token` |
 | **SRT subtitles** | `./scripts/transcribe audio.mp3 --srt -o subs.srt` | Ready for video players |
 | **VTT subtitles** | `./scripts/transcribe audio.mp3 --vtt -o subs.vtt` | Web-compatible format |
 | **JSON output** | `./scripts/transcribe audio.mp3 --json` | Full data with word timestamps |
-| **All formats** | `./scripts/transcribe audio.mp3 --output-format all` | Generates SRT+VTT+TXT+JSON+TSV |
 | **Translate to English** | `./scripts/transcribe audio.mp3 --translate` | Any language → English |
 | **Fast, no alignment** | `./scripts/transcribe audio.mp3 --no-align` | Skip forced alignment |
 | **Specific language** | `./scripts/transcribe audio.mp3 -l en` | Faster than auto-detect |
+
+**⚠️ Do NOT run `whisperx` CLI directly** — it will crash on PyTorch 2.6+ with pyannote models. Always use this skill's `./scripts/transcribe` wrapper.
 
 ## Model Selection
 
@@ -75,39 +78,57 @@ Use this skill when you need to:
 
 ## Setup
 
-### Prerequisites
-- Python 3.10+
-- ffmpeg
-- NVIDIA GPU with CUDA (strongly recommended)
+### First-Time Setup
 
-### Installation
+**Prerequisites:** Python 3.10+, ffmpeg, NVIDIA GPU with CUDA (strongly recommended)
+
+**Step 1: Install whisperx**
 
 ```bash
-# Run the setup script (detects existing install or creates venv)
+# Option A: Run the setup script (auto-detects GPU, creates venv if needed)
 ./setup.sh
-```
 
-Or install manually:
-
-```bash
+# Option B: Install globally (if you prefer)
 pip install whisperx
 ```
 
-### Speaker Diarization Setup
+**Step 2 (optional, for diarization): Set up Hugging Face token**
 
-Diarization requires a free Hugging Face account and access to two gated models:
+Speaker diarization requires a free Hugging Face account and access to two gated models. Skip this if you only need transcription/alignment.
 
 1. Create account at [huggingface.co](https://huggingface.co) (if you don't have one)
 2. Go to [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and create a **read** access token
-3. Accept **both** model agreements (click "Agree and access repository" on each):
+3. Accept **both** model agreements (click "Agree and access repository" on each page):
    - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
    - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-4. Save the token (pick one method):
-   - **Recommended:** `mkdir -p ~/.cache/huggingface && echo -n "hf_YOUR_TOKEN" > ~/.cache/huggingface/token` (auto-detected by the script)
-   - Or set env var: `export HF_TOKEN=hf_YOUR_TOKEN`
-   - Or pass per-command: `--hf-token hf_YOUR_TOKEN`
+4. Save the token so the script auto-detects it:
+   ```bash
+   mkdir -p ~/.cache/huggingface && echo -n "hf_YOUR_TOKEN" > ~/.cache/huggingface/token && chmod 600 ~/.cache/huggingface/token
+   ```
+   Alternatively: set `HF_TOKEN` env var, or pass `--hf-token` per-command.
 
 **Note:** The token and model access are completely free. The models are just gated behind a click-to-agree license. Without step 3, you'll get a 403 error even with a valid token.
+
+### Subsequent Runs
+
+No setup needed — just run `./scripts/transcribe`. The wrapper script:
+- Auto-detects GPU/CPU and picks optimal compute type
+- Auto-reads the HF token from `~/.cache/huggingface/token` for diarization
+- Applies the PyTorch 2.6+ compatibility patch automatically (see below)
+- First run for a new model downloads it to `~/.cache/huggingface/` (one-time per model)
+
+### Checking If It's Working
+
+```bash
+# Quick test — should print transcript to stdout
+./scripts/transcribe some_audio.mp3
+
+# Test diarization — should show [SPEAKER_00], [SPEAKER_01], etc.
+./scripts/transcribe some_audio.mp3 --diarize
+
+# If diarization fails with 403: model agreements not accepted (see step 3 above)
+# If it crashes with pickle/weights_only error: you're running `whisperx` CLI directly instead of the wrapper
+```
 
 ### Platform Support
 
@@ -121,33 +142,35 @@ Diarization requires a free Hugging Face account and access to two gated models:
 
 ## Usage
 
+All commands use `./scripts/transcribe` — resolve the path relative to this skill's directory.
+
 ```bash
 # Basic transcription (word-aligned)
 ./scripts/transcribe audio.mp3
 
-# With speaker diarization
-./scripts/transcribe audio.mp3 --diarize --hf-token YOUR_TOKEN
+# With speaker diarization (auto-reads ~/.cache/huggingface/token)
+./scripts/transcribe audio.mp3 --diarize
 
-# Generate SRT subtitles with word highlighting
-./scripts/transcribe audio.mp3 --srt --highlight-words -o subtitles.srt
+# With explicit HF token
+./scripts/transcribe audio.mp3 --diarize --hf-token hf_YOUR_TOKEN
+
+# Generate SRT subtitles
+./scripts/transcribe audio.mp3 --srt -o subtitles.srt
 
 # Maximum accuracy
-./scripts/transcribe audio.mp3 --model large-v3 --beam-size 10
+./scripts/transcribe audio.mp3 --model large-v3
 
 # Translate non-English audio to English
-./scripts/transcribe audio.mp3 --translate --language ja
+./scripts/transcribe audio.mp3 --translate -l ja
 
 # Fast mode (skip alignment)
 ./scripts/transcribe audio.mp3 --no-align
 
-# Generate all output formats
-./scripts/transcribe audio.mp3 --output-format all --output-dir ./output
-
-# JSON with full metadata
+# JSON with full metadata and word timestamps
 ./scripts/transcribe audio.mp3 --json -o transcript.json
 
 # Specify known speaker count for better diarization
-./scripts/transcribe audio.mp3 --diarize --min-speakers 2 --max-speakers 4 --hf-token TOKEN
+./scripts/transcribe audio.mp3 --diarize --min-speakers 2 --max-speakers 4
 ```
 
 ## Options
@@ -158,7 +181,6 @@ AUDIO_FILE               Path to audio/video file
 Model options:
   -m, --model NAME       Whisper model (default: large-v3-turbo)
   --batch-size N         Batch size for inference (default: 8, lower if OOM)
-  --beam-size N          Beam search size (higher = slower but more accurate)
 
 Device options:
   --device               cpu, cuda, or auto (default: auto)
@@ -174,7 +196,7 @@ Alignment options:
 
 Speaker diarization:
   --diarize              Enable speaker labels
-  --hf-token TOKEN       Hugging Face access token
+  --hf-token TOKEN       Hugging Face access token (also reads ~/.cache/huggingface/token or HF_TOKEN env)
   --min-speakers N       Minimum speaker count hint
   --max-speakers N       Maximum speaker count hint
 
@@ -182,14 +204,9 @@ Output options:
   -j, --json             JSON output with segments and word timestamps
   --srt                  SRT subtitle format
   --vtt                  WebVTT subtitle format
-  --output-format FMT    all, srt, vtt, txt, tsv, json, aud (default: txt)
   -o, --output FILE      Save to file instead of stdout
-  --output-dir DIR       Directory for output files
-  --highlight-words      Underline words as spoken in SRT/VTT
 
 Miscellaneous:
-  --suppress-numerals    Spell out numbers instead of digits
-  --verbose              Show full whisperx output
   -q, --quiet            Suppress progress messages
 ```
 
@@ -197,11 +214,11 @@ Miscellaneous:
 
 ```bash
 # Transcribe a meeting recording with speakers
-./scripts/transcribe meeting.mp3 --diarize --hf-token TOKEN \
+./scripts/transcribe meeting.mp3 --diarize \
   --min-speakers 3 --max-speakers 5 --json -o meeting.json
 
-# Generate YouTube-style subtitles
-./scripts/transcribe video.mp4 --srt --highlight-words -o video.srt
+# Generate subtitles
+./scripts/transcribe video.mp4 --srt -o video.srt
 
 # Batch transcribe a folder
 for file in recordings/*.mp3; do
@@ -210,12 +227,12 @@ done
 
 # Transcribe YouTube audio (with yt-dlp)
 yt-dlp -x --audio-format mp3 <URL> -o audio.mp3
-./scripts/transcribe audio.mp3 --diarize --hf-token TOKEN
+./scripts/transcribe audio.mp3 --diarize
 
 # Quick draft (fast, no alignment)
 ./scripts/transcribe audio.mp3 --model base --no-align
 
-# German audio with specific alignment model
+# German audio
 ./scripts/transcribe audio.mp3 -l de --model large-v3-turbo
 ```
 
