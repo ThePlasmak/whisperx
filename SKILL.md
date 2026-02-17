@@ -4,6 +4,7 @@ description: Speech-to-text with word-level timestamps, speaker diarization, and
 version: 1.1.0
 author: Sarah Mak
 tags: ["audio", "transcription", "whisperx", "speech-to-text", "diarization", "alignment", "subtitles", "ml", "cuda", "gpu"]
+homepage: https://github.com/ThePlasmak/whisperx
 platforms: ["linux", "macos", "wsl2"]
 metadata: {"openclaw":{"emoji":"🎙️","requires":{"bins":["ffmpeg","python3"]}}}
 ---
