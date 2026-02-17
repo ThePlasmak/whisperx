@@ -95,12 +95,19 @@ pip install whisperx
 
 ### Speaker Diarization Setup
 
-Diarization requires a free Hugging Face token:
+Diarization requires a free Hugging Face account and access to two gated models:
 
-1. Create account at [huggingface.co](https://huggingface.co)
-2. Generate read token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
-3. Accept the model agreement: [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)
-4. Pass token via `--hf-token TOKEN` or set `HF_TOKEN` env var
+1. Create account at [huggingface.co](https://huggingface.co) (if you don't have one)
+2. Go to [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and create a **read** access token
+3. Accept **both** model agreements (click "Agree and access repository" on each):
+   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
+   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+4. Save the token (pick one method):
+   - **Recommended:** `mkdir -p ~/.cache/huggingface && echo -n "hf_YOUR_TOKEN" > ~/.cache/huggingface/token` (auto-detected by the script)
+   - Or set env var: `export HF_TOKEN=hf_YOUR_TOKEN`
+   - Or pass per-command: `--hf-token hf_YOUR_TOKEN`
+
+**Note:** The token and model access are completely free. The models are just gated behind a click-to-agree license. Without step 3, you'll get a 403 error even with a valid token.
 
 ### Platform Support
 
