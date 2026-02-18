@@ -7,14 +7,33 @@ Uses the whisperx Python API directly (not subprocess) to apply PyTorch 2.6+
 compatibility patches for pyannote model loading.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import sys
 import os
 import json
 import argparse
 import time
+import signal
+import tempfile
 from pathlib import Path
+
+# --- Signal handling for graceful shutdown ---
+_cleanup_files = []
+
+def _signal_handler(sig, frame):
+    """Clean up temp files on interrupt."""
+    for f in _cleanup_files:
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+    print("\n   Interrupted.", file=sys.stderr)
+    sys.exit(130)  # 128 + SIGINT
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+# --- End signal handling ---
 
 # --- PyTorch 2.6+ compatibility patch ---
 # pyannote.audio and lightning_fabric use torch.load with weights_only=True (new default),
@@ -102,6 +121,102 @@ def parse_time(time_str):
         sys.exit(1)
 
 
+def _merge_speaker_segments(segments):
+    """Merge consecutive segments from the same speaker for cleaner output."""
+    if not segments:
+        return segments
+
+    merged = []
+    current = dict(segments[0])
+    if "words" in current:
+        current["words"] = list(current["words"])
+
+    for seg in segments[1:]:
+        if seg.get("speaker") and seg.get("speaker") == current.get("speaker"):
+            # Same speaker — merge
+            current["end"] = seg.get("end", current.get("end"))
+            current_text = current.get("text", "").rstrip()
+            seg_text = seg.get("text", "").lstrip()
+            current["text"] = current_text + " " + seg_text
+            if "words" in current and "words" in seg:
+                current["words"].extend(seg["words"])
+            elif "words" in seg:
+                current["words"] = list(seg["words"])
+        else:
+            merged.append(current)
+            current = dict(seg)
+            if "words" in current:
+                current["words"] = list(current["words"])
+
+    merged.append(current)
+    return merged
+
+
+def _rename_speakers(segments, name_list):
+    """Rename SPEAKER_00, SPEAKER_01, etc. to provided names."""
+    name_map = {}
+    for i, name in enumerate(name_list):
+        name = name.strip()
+        if name:
+            name_map[f"SPEAKER_{i:02d}"] = name
+
+    for seg in segments:
+        if "speaker" in seg and seg["speaker"] in name_map:
+            seg["speaker"] = name_map[seg["speaker"]]
+        for word in seg.get("words", []):
+            if "speaker" in word and word["speaker"] in name_map:
+                word["speaker"] = name_map[word["speaker"]]
+
+    return segments
+
+
+def _wrap_text(text, max_width):
+    """Wrap text at word boundaries to fit within max_width chars per line."""
+    if not max_width or len(text) <= max_width:
+        return text
+
+    words = text.split()
+    lines = []
+    current_line = []
+    current_len = 0
+
+    for word in words:
+        word_len = len(word)
+        space = 1 if current_line else 0
+        if current_len + space + word_len > max_width and current_line:
+            lines.append(" ".join(current_line))
+            current_line = [word]
+            current_len = word_len
+        else:
+            current_line.append(word)
+            current_len += space + word_len
+
+    if current_line:
+        lines.append(" ".join(current_line))
+
+    return "\n".join(lines)
+
+
+def _speaker_summary(segments):
+    """Generate a summary of speaker talk time."""
+    speakers = {}
+    for seg in segments:
+        speaker = seg.get("speaker")
+        if not speaker:
+            continue
+        duration = (seg.get("end", 0) or 0) - (seg.get("start", 0) or 0)
+        if duration > 0:
+            speakers[speaker] = speakers.get(speaker, 0) + duration
+
+    if not speakers:
+        return None
+
+    # Sort by talk time (descending)
+    sorted_speakers = sorted(speakers.items(), key=lambda x: x[1], reverse=True)
+    parts = [f"{name}: {dur:.1f}s" for name, dur in sorted_speakers]
+    return f"{len(sorted_speakers)} ({', '.join(parts)})"
+
+
 def run_whisperx(args):
     """Run whisperx using the Python API."""
     try:
@@ -154,6 +269,8 @@ def run_whisperx(args):
             features.append("alignment")
         if args.word_level:
             features.append("word-level subtitles")
+        if args.merge_speakers:
+            features.append("merge speakers")
         if features:
             print(f"   Features: {', '.join(features)}", file=sys.stderr)
 
@@ -201,24 +318,34 @@ def run_whisperx(args):
 
     # 2. Transcribe with batched inference
     task = "translate" if args.translate else "transcribe"
-    model = whisperx.load_model(
-        args.model,
-        device,
-        compute_type=compute_type,
-        language=args.language,
-        task=task,
-        vad_method="silero",  # silero avoids pyannote VAD torch.load issue
-    )
+
+    # Build asr_options for model-level settings (beam_size, initial_prompt, hotwords)
+    asr_options = {}
+    if args.beam_size is not None:
+        asr_options["beam_size"] = args.beam_size
+    if args.initial_prompt:
+        asr_options["initial_prompt"] = args.initial_prompt
+    if args.hotwords:
+        asr_options["hotwords"] = args.hotwords
+
+    load_kwargs = {
+        "compute_type": compute_type,
+        "language": args.language,
+        "task": task,
+        "vad_method": "silero",  # silero avoids pyannote VAD torch.load issue
+    }
+    if asr_options:
+        load_kwargs["asr_options"] = asr_options
+    if args.threads:
+        load_kwargs["threads"] = args.threads
+
+    model = whisperx.load_model(args.model, device, **load_kwargs)
 
     transcribe_kwargs = {
         "batch_size": args.batch_size,
         "language": args.language,
         "print_progress": not args.quiet,
     }
-    if args.beam_size:
-        transcribe_kwargs["beam_size"] = args.beam_size
-    if args.initial_prompt:
-        transcribe_kwargs["initial_prompt"] = args.initial_prompt
 
     result = model.transcribe(audio, **transcribe_kwargs)
 
@@ -231,6 +358,22 @@ def run_whisperx(args):
     gc.collect()
     if device == "cuda":
         torch.cuda.empty_cache()
+
+    # Check for empty results
+    if not result.get("segments"):
+        if not args.quiet:
+            print("\n⚠️  No speech detected in the audio.", file=sys.stderr)
+        # Produce valid empty output
+        segments = []
+        output = _format_output(segments, args.output_format, args.diarize, args.word_level, args.max_line_width)
+        if args.output:
+            Path(args.output).write_text(output, encoding="utf-8")
+            if not args.quiet:
+                print(f"✅ Saved (empty) to: {args.output}", file=sys.stderr)
+        else:
+            if output.strip():
+                print(output)
+        return
 
     # 3. Forced alignment (unless --no-align)
     if not args.no_align:
@@ -273,35 +416,60 @@ def run_whisperx(args):
         if not args.quiet:
             print("   Diarizing speakers...", file=sys.stderr)
 
-        from whisperx.diarize import DiarizationPipeline
-        diarize_model = DiarizationPipeline(
-            use_auth_token=hf_token,
-            device=device,
-        )
+        try:
+            from whisperx.diarize import DiarizationPipeline
+            diarize_model = DiarizationPipeline(
+                use_auth_token=hf_token,
+                device=device,
+            )
 
-        diarize_kwargs = {}
-        if args.min_speakers:
-            diarize_kwargs["min_speakers"] = args.min_speakers
-        if args.max_speakers:
-            diarize_kwargs["max_speakers"] = args.max_speakers
+            diarize_kwargs = {}
+            if args.min_speakers:
+                diarize_kwargs["min_speakers"] = args.min_speakers
+            if args.max_speakers:
+                diarize_kwargs["max_speakers"] = args.max_speakers
 
-        diarize_segments = diarize_model(audio, **diarize_kwargs)
-        result = whisperx.assign_word_speakers(diarize_segments, result)
+            diarize_segments = diarize_model(audio, **diarize_kwargs)
+            result = whisperx.assign_word_speakers(diarize_segments, result)
 
-        del diarize_model
-        gc.collect()
-        if device == "cuda":
-            torch.cuda.empty_cache()
+            del diarize_model
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
+        except Exception as e:
+            print(f"❌ Diarization failed: {e}", file=sys.stderr)
+            if "403" in str(e) or "Forbidden" in str(e):
+                print("   This usually means you haven't accepted the model agreements.", file=sys.stderr)
+                print("   For whisperx <3.8.0, accept BOTH:", file=sys.stderr)
+                print("     https://huggingface.co/pyannote/speaker-diarization-3.1", file=sys.stderr)
+                print("     https://huggingface.co/pyannote/segmentation-3.0", file=sys.stderr)
+                print("   For whisperx >=3.8.0, accept:", file=sys.stderr)
+                print("     https://huggingface.co/pyannote/speaker-diarization-community-1", file=sys.stderr)
+            elif "token" in str(e).lower() or "auth" in str(e).lower():
+                print("   Check that your HF token is valid and has read access.", file=sys.stderr)
+            else:
+                print("   Continuing without speaker labels.", file=sys.stderr)
+            # Continue without diarization rather than crashing
+            args.diarize = False
 
     # Adjust timestamps if audio was trimmed
     if start_seconds and start_seconds > 0:
         _offset_timestamps(result, start_seconds)
 
-    # 5. Output results
+    # 5. Post-process segments
     segments = result.get("segments", [])
 
-    output_format = args.output_format
-    output = _format_output(segments, output_format, args.diarize, args.word_level)
+    # Rename speakers if names provided
+    if args.speaker_names and args.diarize:
+        names = [n.strip() for n in args.speaker_names.split(",")]
+        segments = _rename_speakers(segments, names)
+
+    # Merge consecutive same-speaker segments
+    if args.merge_speakers and args.diarize:
+        segments = _merge_speaker_segments(segments)
+
+    # 6. Output results
+    output = _format_output(segments, args.output_format, args.diarize, args.word_level, args.max_line_width)
 
     if args.output:
         Path(args.output).write_text(output, encoding="utf-8")
@@ -316,7 +484,14 @@ def run_whisperx(args):
         speed = audio_duration / elapsed if elapsed > 0 else 0
         seg_count = len(segments)
         word_count = sum(len(seg.get("words", [])) for seg in segments)
-        print(f"\n   Done in {elapsed:.1f}s ({speed:.1f}x realtime) — {seg_count} segments, {word_count} words", file=sys.stderr)
+        stats = f"\n   Done in {elapsed:.1f}s ({speed:.1f}x realtime) — {seg_count} segments, {word_count} words"
+        print(stats, file=sys.stderr)
+
+        # Speaker summary
+        if args.diarize:
+            summary = _speaker_summary(segments)
+            if summary:
+                print(f"   Speakers: {summary}", file=sys.stderr)
 
 
 def _offset_timestamps(result, offset):
@@ -334,18 +509,18 @@ def _offset_timestamps(result, offset):
                 word["end"] = word["end"] + offset
 
 
-def _format_output(segments, output_format, include_speaker, word_level):
+def _format_output(segments, output_format, include_speaker, word_level, max_line_width=None):
     """Route to the appropriate output formatter."""
     if output_format == "json":
         return _segments_to_json(segments)
     elif output_format == "srt":
         if word_level:
             return _segments_to_word_srt(segments, include_speaker)
-        return _segments_to_srt(segments, include_speaker)
+        return _segments_to_srt(segments, include_speaker, max_line_width)
     elif output_format == "vtt":
         if word_level:
             return _segments_to_word_vtt(segments, include_speaker)
-        return _segments_to_vtt(segments, include_speaker)
+        return _segments_to_vtt(segments, include_speaker, max_line_width)
     elif output_format == "tsv":
         return _segments_to_tsv(segments, include_speaker)
     else:
@@ -384,7 +559,6 @@ def _format_timestamp_vtt(seconds):
 
 def _segments_to_json(segments):
     """Convert segments to clean JSON output."""
-    # Build a clean, serializable structure
     clean_segments = []
     for seg in segments:
         clean_seg = {
@@ -414,28 +588,36 @@ def _segments_to_json(segments):
     return json.dumps(output, indent=2, ensure_ascii=False)
 
 
-def _segments_to_srt(segments, include_speaker=False):
+def _segments_to_srt(segments, include_speaker=False, max_line_width=None):
     """Convert segments to SRT subtitle format."""
     lines = []
     for i, seg in enumerate(segments, 1):
         start = _format_timestamp_srt(seg.get("start", 0))
         end = _format_timestamp_srt(seg.get("end", 0))
         text = seg.get("text", "").strip()
+        if max_line_width:
+            text = _wrap_text(text, max_line_width)
         if include_speaker and "speaker" in seg:
             text = f"[{seg['speaker']}] {text}"
         lines.append(f"{i}\n{start} --> {end}\n{text}\n")
     return "\n".join(lines)
 
 
-def _segments_to_vtt(segments, include_speaker=False):
-    """Convert segments to WebVTT subtitle format."""
+def _segments_to_vtt(segments, include_speaker=False, max_line_width=None):
+    """Convert segments to WebVTT subtitle format.
+
+    When include_speaker is True, uses <v Speaker> voice tags (proper VTT standard)
+    instead of [SPEAKER_00] text prefixes.
+    """
     lines = ["WEBVTT\n"]
     for seg in segments:
         start = _format_timestamp_vtt(seg.get("start", 0))
         end = _format_timestamp_vtt(seg.get("end", 0))
         text = seg.get("text", "").strip()
+        if max_line_width:
+            text = _wrap_text(text, max_line_width)
         if include_speaker and "speaker" in seg:
-            text = f"[{seg['speaker']}] {text}"
+            text = f"<v {seg['speaker']}>{text}</v>"
         lines.append(f"{start} --> {end}\n{text}\n")
     return "\n".join(lines)
 
@@ -485,13 +667,9 @@ def _segments_to_word_vtt(segments, include_speaker=False):
             end = _format_timestamp_vtt(seg.get("end", 0))
             text = seg.get("text", "").strip()
             if include_speaker and "speaker" in seg:
-                text = f"[{seg['speaker']}] {text}"
+                text = f"<v {seg['speaker']}>{text}</v>"
             lines.append(f"{start} --> {end}\n{text}\n")
             continue
-
-        speaker_prefix = ""
-        if include_speaker and "speaker" in seg:
-            speaker_prefix = f"[{seg['speaker']}] "
 
         for w in words:
             if "start" not in w or "end" not in w:
@@ -501,7 +679,9 @@ def _segments_to_word_vtt(segments, include_speaker=False):
             word_text = w.get("word", "").strip()
             if not word_text:
                 continue
-            lines.append(f"{start} --> {end}\n{speaker_prefix}{word_text}\n")
+            if include_speaker and "speaker" in seg:
+                word_text = f"<v {seg['speaker']}>{word_text}</v>"
+            lines.append(f"{start} --> {end}\n{word_text}\n")
 
     return "\n".join(lines)
 
@@ -534,14 +714,16 @@ Examples:
   %(prog)s audio.mp3 --json                     # JSON with word timestamps
   %(prog)s audio.mp3 --translate                # Translate to English
   %(prog)s audio.mp3 --start 1:30 --end 5:00   # Transcribe a section
-  %(prog)s audio.mp3 --initial-prompt "OpenAI"  # Improve accuracy for terms
+  %(prog)s audio.mp3 --hotwords "OpenAI GPT-4"  # Boost specific term recognition
+  %(prog)s audio.mp3 --diarize --merge-speakers  # Clean diarized output
+  %(prog)s - < audio.mp3                        # Read from stdin
 """
     )
 
     parser.add_argument(
         "audio",
         metavar="AUDIO_FILE",
-        help="Path to audio/video file (mp3, wav, m4a, flac, ogg, opus, webm, mp4, mkv, avi, mov, wma, aac)"
+        help="Path to audio/video file, or '-' to read from stdin"
     )
     parser.add_argument(
         "-V", "--version",
@@ -577,6 +759,12 @@ Examples:
         metavar="TEXT",
         help="Initial text prompt to condition the model (improves accuracy for domain-specific terms, names, acronyms)"
     )
+    model_group.add_argument(
+        "--hotwords",
+        default=None,
+        metavar="TEXT",
+        help="Space-separated hotwords to boost recognition (e.g., \"OpenAI Kubernetes gRPC\"). Requires whisperx >=3.7.5"
+    )
 
     # Device options
     device_group = parser.add_argument_group("Device options")
@@ -591,6 +779,13 @@ Examples:
         default="auto",
         choices=["auto", "int8", "float16", "float32"],
         help="Quantization (default: auto — float16 on GPU, int8 on CPU)"
+    )
+    device_group.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help="CPU threads for CTranslate2 inference (default: 4). Most useful on CPU mode"
     )
 
     # Language options
@@ -663,6 +858,17 @@ Examples:
         metavar="N",
         help="Maximum number of speakers (helps diarization accuracy)"
     )
+    diarize_group.add_argument(
+        "--merge-speakers",
+        action="store_true",
+        help="Merge consecutive segments from the same speaker (cleaner output)"
+    )
+    diarize_group.add_argument(
+        "--speaker-names",
+        default=None,
+        metavar="NAMES",
+        help="Comma-separated names to replace SPEAKER_00, SPEAKER_01, etc. (e.g., \"Alice,Bob,Charlie\")"
+    )
 
     # Output options
     output_group = parser.add_argument_group("Output options")
@@ -679,7 +885,7 @@ Examples:
     output_group.add_argument(
         "--vtt",
         action="store_true",
-        help="Output as WebVTT subtitle format"
+        help="Output as WebVTT subtitle format (uses <v> voice tags for speakers)"
     )
     output_group.add_argument(
         "--tsv",
@@ -690,6 +896,13 @@ Examples:
         "--word-level",
         action="store_true",
         help="Word-level subtitles (one word per cue) for SRT/VTT — karaoke-style timing"
+    )
+    output_group.add_argument(
+        "--max-line-width",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Maximum characters per subtitle line (wraps at word boundaries). Standard: 42"
     )
     output_group.add_argument(
         "--output-format",
@@ -712,6 +925,24 @@ Examples:
     )
 
     args = parser.parse_args()
+
+    # Handle stdin pipe
+    if args.audio == "-":
+        if not args.quiet:
+            print("   Reading audio from stdin...", file=sys.stderr)
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        try:
+            tmp.write(sys.stdin.buffer.read())
+            tmp.close()
+            args.audio = tmp.name
+            _cleanup_files.append(tmp.name)
+        except Exception as e:
+            print(f"❌ Failed to read from stdin: {e}", file=sys.stderr)
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            sys.exit(1)
 
     # Validate audio file
     audio_path = Path(args.audio)
@@ -749,7 +980,29 @@ Examples:
         print("⚠️  --word-level requires alignment. Ignoring --no-align.", file=sys.stderr)
         args.no_align = False
 
-    run_whisperx(args)
+    # Warn if --merge-speakers or --speaker-names used without --diarize
+    if args.merge_speakers and not args.diarize:
+        print("⚠️  --merge-speakers requires --diarize. Ignoring.", file=sys.stderr)
+        args.merge_speakers = False
+
+    if args.speaker_names and not args.diarize:
+        print("⚠️  --speaker-names requires --diarize. Ignoring.", file=sys.stderr)
+        args.speaker_names = None
+
+    # Warn if --max-line-width used with non-subtitle format
+    if args.max_line_width and args.output_format not in ("srt", "vtt"):
+        print("⚠️  --max-line-width only applies to SRT/VTT output. Ignoring.", file=sys.stderr)
+        args.max_line_width = None
+
+    try:
+        run_whisperx(args)
+    finally:
+        # Clean up temp files (stdin pipe)
+        for f in _cleanup_files:
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
